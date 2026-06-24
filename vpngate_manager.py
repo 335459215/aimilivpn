@@ -1722,11 +1722,14 @@ def maintain_valid_nodes(force: bool = False) -> str:
             return msg
         is_connecting = True
     try:
+        _gm = sys.modules.get('gateway_manager')
+        _multi = _gm and _gm.is_active()
+        
         if force:
             with lock:
                 stop_active_openvpn()
             reconnect_fixed_node_if_needed(load_ui_config())
-        elif not active_openvpn_running():
+        elif not active_openvpn_running() and not _multi:
             ui_cfg = load_ui_config()
             routing_mode = ui_cfg.get("routing_mode", "auto")
             connection_enabled = ui_cfg.get("connection_enabled", True)
@@ -4978,6 +4981,12 @@ def background_proxy_checker() -> None:
     while True:
         last_checker_heartbeat = time.time()
         try:
+            # Multi-gateway mode: health check is handled per-gateway by gateway_manager
+            _gm = sys.modules.get('gateway_manager')
+            if _gm and _gm.is_active():
+                time.sleep(30)
+                continue
+            
             if is_connecting:
                 time.sleep(5)
                 continue
@@ -5033,6 +5042,12 @@ def active_node_pinger() -> None:
     while True:
         last_pinger_heartbeat = time.time()
         try:
+            # Multi-gateway mode: per-gateway ping handled by gateway_manager health loops
+            _gm = sys.modules.get('gateway_manager')
+            if _gm and _gm.is_active():
+                time.sleep(30)
+                continue
+            
             if active_openvpn_running() and active_openvpn_node_id:
                 nodes = read_nodes()
                 node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
@@ -5760,50 +5775,61 @@ def main() -> None:
             "blacklisted_nodes": 0,
         },
     )
-    threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
+
+    # ── Multi-gateway mode: start proxy servers for each configured gateway ──
+    try:
+        import gateway_manager as gm
+        gm.set_globals(DATA_DIR, API_URL, OPENVPN_TEST_TIMEOUT_SECONDS)
+        gm.start_gateways(proxy_host=LOCAL_PROXY_HOST)
+        _use_multi_gateway = True
+        print("[网关] 多网关模式已启动 (gateway_manager)", flush=True)
+    except Exception as e:
+        _use_multi_gateway = False
+        print(f"[网关] 多网关模式初始化失败，回退到单网关模式: {e}", flush=True)
     
-    # Wait for the gateway to officially start
-    print("[网关] 正在启动代理网关...", flush=True)
-    gateway_ready = False
-    is_ipv6 = ":" in LOCAL_PROXY_HOST
-    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-    for _ in range(30):
-        s = None
-        try:
-            s = socket.socket(af, socket.SOCK_STREAM)
-            s.settimeout(0.5)
-            connect_host = LOCAL_PROXY_HOST
-            if connect_host in ("::", "0.0.0.0", ""):
-                connect_host = "::1" if is_ipv6 else "127.0.0.1"
+    # ── Single-gateway fallback (legacy) ──
+    if not _use_multi_gateway:
+        threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
+        print("[网关] 单代理网关: 正在启动...", flush=True)
+        gateway_ready = False
+        is_ipv6 = ":" in LOCAL_PROXY_HOST
+        af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+        for _ in range(30):
+            s = None
             try:
-                s.connect((connect_host, LOCAL_PROXY_PORT))
-                gateway_ready = True
-                break
+                s = socket.socket(af, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                connect_host = LOCAL_PROXY_HOST
+                if connect_host in ("::", "0.0.0.0", ""):
+                    connect_host = "::1" if is_ipv6 else "127.0.0.1"
+                try:
+                    s.connect((connect_host, LOCAL_PROXY_PORT))
+                    gateway_ready = True
+                    break
+                except Exception:
+                    if connect_host == "::1":
+                        try:
+                            s.close()
+                            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            s.settimeout(0.5)
+                            s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
+                            gateway_ready = True
+                            break
+                        except Exception:
+                            pass
+                    raise
             except Exception:
-                if connect_host == "::1":
+                time.sleep(0.5)
+            finally:
+                if s is not None:
                     try:
                         s.close()
-                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        s.settimeout(0.5)
-                        s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
-                        gateway_ready = True
-                        break
                     except Exception:
                         pass
-                raise
-        except Exception:
-            time.sleep(0.5)
-        finally:
-            if s is not None:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-            
-    if gateway_ready:
-        print("[网关] 代理网关已成功启动监听，启动同步与检测脚本...", flush=True)
-    else:
-        print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
+        if gateway_ready:
+            print("[网关] 代理网关已成功启动监听，启动同步与检测脚本...", flush=True)
+        else:
+            print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
 
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
@@ -5814,7 +5840,7 @@ def main() -> None:
     ui_port = bounded_int(ui_cfg.get("port"), UI_PORT, 1, 65535)
     
     print(f"UI: http://{ui_host}:{ui_port}/", flush=True)
-    print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
+    print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT} (多网关模式时各端口见配置)", flush=True)
     DualStackHTTPServer((ui_host, ui_port), Handler).serve_forever()
 
 if __name__ == "__main__":

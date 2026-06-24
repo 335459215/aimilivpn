@@ -84,7 +84,7 @@ def check_credentials(username: str | None, password: str | None) -> bool:
         return True
     return secrets.compare_digest(username or "", expected_user) and secrets.compare_digest(password or "", expected_pass)
 
-def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
+def dns_query_over_tun(host: str, qtype: int, dns_server: str, timeout: float, tun_device: str | bytes = "tun0") -> str | None:
     import random
     sock = None
     try:
@@ -109,12 +109,16 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            if isinstance(tun_device, str):
+                tun_device_bytes = tun_device.encode()
+            else:
+                tun_device_bytes = tun_device
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, tun_device_bytes)
         except OSError as e:
             if "operation not permitted" in str(e).lower() or e.errno == 1:
-                print("[DNS 绑定失败] [错误代码 3006] DNS 解析绑定 tun0 权限不足，请确保程序以 root 权限运行！", flush=True)
+                print(f"[DNS 绑定失败] [错误代码 3006] DNS 解析绑定 {tun_device} 权限不足，请确保程序以 root 权限运行！", flush=True)
             elif "no such device" in str(e).lower() or e.errno == 19:
-                print("[DNS 绑定失败] [错误代码 3004] DNS 解析绑定 tun0 失败，网卡设备不存在，请检查 VPN 连接！", flush=True)
+                print(f"[DNS 绑定失败] [错误代码 3004] DNS 解析绑定 {tun_device} 失败，网卡设备不存在，请检查 VPN 连接！", flush=True)
             return None
         sock.sendto(packet, (dns_server, 53))
         resp, _ = sock.recvfrom(4096)
@@ -178,7 +182,7 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
         return None
     return None
 
-def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+def resolve_dns_over_tun(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0, tun_device: str | bytes = "tun0") -> str | None:
     try:
         socket.inet_aton(host)
         return host
@@ -189,11 +193,11 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
         return host
     except OSError:
         pass
-    return dns_query_over_tun0(host, 1, dns_server, timeout) or dns_query_over_tun0(host, 28, dns_server, timeout)
+    return dns_query_over_tun(host, 1, dns_server, timeout, tun_device=tun_device) or dns_query_over_tun(host, 28, dns_server, timeout, tun_device=tun_device)
 
-def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
+def create_connection(address: tuple[str, int], timeout: float = 20, tun_device: str | bytes = "tun0") -> socket.socket:
     host, port = address
-    resolved_ip = resolve_dns_over_tun0(host)
+    resolved_ip = resolve_dns_over_tun(host, tun_device=tun_device)
     if resolved_ip:
         host = resolved_ip
 
@@ -204,15 +208,19 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            if isinstance(tun_device, str):
+                tun_device_bytes = tun_device.encode()
+            else:
+                tun_device_bytes = tun_device
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, tun_device_bytes)
             sock.connect(sa)
             return sock
         except OSError as e:
             err = e
             if "operation not permitted" in str(e).lower() or e.errno == 1:
-                err = OSError(f"[错误代码 3006] [ERR_PROXY_BIND_TUN_PERM_DENIED] 绑定虚拟网卡 tun0 失败，权限不足！必须以 root 权限运行，或者进程缺少 CAP_NET_RAW 权限。")
+                err = OSError(f"[错误代码 3006] [ERR_PROXY_BIND_TUN_PERM_DENIED] 绑定虚拟网卡 {tun_device} 失败，权限不足！必须以 root 权限运行，或者进程缺少 CAP_NET_RAW 权限。")
             elif "no such device" in str(e).lower() or e.errno == 19:
-                err = OSError(f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定虚拟网卡 tun0 失败，找不到设备！这通常是因为 OpenVPN 核心未能成功连接或已被异常终止。")
+                err = OSError(f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定虚拟网卡 {tun_device} 失败，找不到设备！这通常是因为 OpenVPN 核心未能成功连接或已被异常终止。")
             if sock is not None:
                 sock.close()
     if err is not None:
@@ -233,7 +241,7 @@ def relay(left: socket.socket, right: socket.socket) -> None:
                 return
             target.sendall(data)
 
-def socks5_client(client: socket.socket, first_byte: bytes) -> None:
+def socks5_client(client: socket.socket, first_byte: bytes, tun_device: str | bytes = "tun0") -> None:
     upstream = None
     try:
         methods_count = recv_exact(client, 1)[0]
@@ -270,7 +278,7 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             return
         port = int.from_bytes(recv_exact(client, 2), "big")
         try:
-            upstream = create_connection((host, port), timeout=20)
+            upstream = create_connection((host, port), timeout=20, tun_device=tun_device)
         except Exception as e:
             print(f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}", flush=True)
             try:
@@ -294,7 +302,7 @@ def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
         data += chunk
     return data
 
-def http_client(client: socket.socket, first_byte: bytes) -> None:
+def http_client(client: socket.socket, first_byte: bytes, tun_device: str | bytes = "tun0") -> None:
     upstream = None
     try:
         header = read_http_header(client, first_byte)
@@ -322,7 +330,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
                 return
         if method.upper() == "CONNECT":
             host, port = parse_host_port(target, 443)
-            upstream = create_connection((host, port), timeout=20)
+            upstream = create_connection((host, port), timeout=20, tun_device=tun_device)
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             if rest:
                 upstream.sendall(rest)
@@ -361,7 +369,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-connection:", "connection:", "proxy-authorization:"))]
         request = f"{method} {path} {version}\r\n" + "\r\n".join(headers) + "\r\nConnection: close\r\n\r\n"
-        upstream = create_connection((hostname, port), timeout=20)
+        upstream = create_connection((hostname, port), timeout=20, tun_device=tun_device)
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except Exception as e:
@@ -375,14 +383,14 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         if upstream:
             upstream.close()
 
-def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
+def proxy_client(client: socket.socket, address: tuple[str, int], tun_device: str | bytes = "tun0") -> None:
     try:
         client.settimeout(30)
         first = recv_exact(client, 1)
         if first == b"\x05":
-            socks5_client(client, first)
+            socks5_client(client, first, tun_device=tun_device)
         else:
-            http_client(client, first)
+            http_client(client, first, tun_device=tun_device)
     except Exception as e:
         err_msg = str(e)
         if "[错误代码" in err_msg:
@@ -392,7 +400,7 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
         except OSError:
             pass
 
-def start_proxy_server(host: str, port: int) -> None:
+def start_proxy_server(host: str, port: int, tun_device: str | bytes = "tun0") -> None:
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
     server = None
@@ -461,7 +469,7 @@ def start_proxy_server(host: str, port: int) -> None:
 
             def run_client() -> None:
                 try:
-                    proxy_client(client, address)
+                    proxy_client(client, address, tun_device=tun_device)
                 finally:
                     proxy_connection_sem.release()
 
