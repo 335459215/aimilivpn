@@ -245,22 +245,24 @@ def _apply_routing_filters(candidates: list[dict], gw: GatewayState) -> list[dic
 
 
 def _find_best_node(gw: GatewayState) -> dict | None:
-    """Pick the best *available* + *inactive* node matching gw.country."""
+    """Pick the best *available* node matching gw.country, avoiding itself."""
     nodes = _read_nodes()
+    current_id = gw.openvpn_node_id
+
     candidates = [
         n for n in nodes
         if n.get("probe_status") == "available"
-        and not n.get("active")
+        and n.get("id") != current_id  # never pick ourselves
     ]
     candidates = _apply_routing_filters(candidates, gw)
     if not candidates:
-        # Fallback: also accept nodes where active node is from another tun
-        candidates2 = [
+        # Fallback: relax the no-active filter
+        candidates = [
             n for n in nodes
             if n.get("probe_status") == "available"
+            and n.get("id") != current_id
         ]
-        candidates2 = _apply_routing_filters(candidates2, gw)
-        candidates = candidates2
+        candidates = _apply_routing_filters(candidates, gw)
     if not candidates:
         return None
     candidates.sort(key=lambda n: (
@@ -310,9 +312,10 @@ def connect_gateway_node(gw: GatewayState, node_id: str) -> str:
         # Policy routing for this tunnel
         setup_policy_routing(gw.tun_device, gw.route_table)
 
-        # Mark node active
+        # Mark node active — only affect our own gateway's tracking
         for n in nodes:
-            n["active"] = n.get("id") == node_id
+            if n.get("id") == node_id:
+                n["active"] = True
         _write_nodes(nodes)
 
         print(f"[gw:{gw.name}] Connected {node_id} on {gw.tun_device} port {gw.proxy_port}", flush=True)
@@ -388,11 +391,23 @@ def check_gateway_health(gw: GatewayState) -> dict:
         result["error"] = f"{gw.tun_device} not found"
         return result
 
-    # 3. curl via this gateway's proxy to verify egress
+    # 3. Verify policy routing is active for this tunnel
+    try:
+        r = subprocess.run(
+            ["ip", "route", "show", "table", str(gw.route_table)],
+            capture_output=True, text=True, timeout=3
+        )
+        if r.returncode != 0 or "default" not in r.stdout:
+            result["error"] = f"Policy routing table {gw.route_table} missing or has no default route"
+            return result
+    except Exception as e:
+        result["error"] = f"Failed to check policy routing: {e}"
+        return result
+
+    # 4. curl via this gateway's proxy to verify egress
     if not _data_dir:
         return result
     try:
-        import vpngate_manager as vm
         proxy_url = f"http://127.0.0.1:{gw.proxy_port}"
         r = subprocess.run(
             ["curl", "-s", "--max-time", "10", "-x", proxy_url, "https://checkip.amazonaws.com"],
@@ -414,30 +429,40 @@ def check_gateway_health(gw: GatewayState) -> dict:
 def gateway_health_loop(gw: GatewayState, interval: int = 60):
     """Background loop: periodically check health and auto-migrate on failure."""
     # Wait for initial connection to establish before first health check
-    gw.stop_event.wait(interval * 0.75)
-    
-    while not gw.stop_event.is_set():
-        health = check_gateway_health(gw)
-        gw.health_ok = health["ok"]
-        gw.health_ip = health["ip"]
-        gw.health_latency = health.get("latency_ms", 0)
+    gw.stop_event.wait(interval * 0.25)  # ~15s first check (was 45s)
 
-        if not health["ok"] and gw.connection_enabled:
-            # Only auto-switch if we've previously had a successful connection
-            if gw.openvpn_node_id:
-                print(f"[gw:{gw.name}] Health check failed: {health.get('error', 'unknown')}, auto-switching...", flush=True)
-                threading.Thread(target=auto_switch_gateway, args=(gw, 0), daemon=True).start()
-        elif health["ok"]:
-            print(f"[gw:{gw.name}] Health OK: {health['ip']}", flush=True)
+    while not gw.stop_event.is_set():
+        try:
+            health = check_gateway_health(gw)
+            gw.health_ok = health["ok"]
+            gw.health_ip = health["ip"]
+            gw.health_latency = health.get("latency_ms", 0)
+
+            if not health["ok"] and gw.connection_enabled:
+                # Only auto-switch if we've previously had a successful connection
+                if gw.openvpn_node_id:
+                    print(f"[gw:{gw.name}] Health check failed: {health.get('error', 'unknown')}, auto-switching...", flush=True)
+                    threading.Thread(target=auto_switch_gateway, args=(gw, 0), daemon=True).start()
+            elif health["ok"]:
+                print(f"[gw:{gw.name}] Health OK: {health['ip']}", flush=True)
+        except Exception as e:
+            print(f"[gw:{gw.name}] Health loop exception: {e}, will retry", flush=True)
 
         gw.stop_event.wait(interval)
 
 
 # ── bootstrap ──────────────────────────────────────────
 
-def get_available_tun_name(index: int) -> str:
-    """Return tunX name. tun2 for index 0 (in case tun0/tun1 taken), tun3 for 1, etc."""
-    return f"tun{index + 2}"
+def get_available_tun_name(index: int, prefer_start: int = 2) -> str:
+    """Return the first unused tunX name starting from prefer_start.
+    Falls back sequentially so we don't collide with other tun devices.
+    """
+    candidate = prefer_start
+    while True:
+        name = f"tun{candidate}"
+        if not Path(f"/sys/class/net/{name}").exists():
+            return name
+        candidate += 1
 
 
 def init_gateways(proxy_host: str = "0.0.0.0") -> list[GatewayState]:
@@ -523,6 +548,7 @@ def gateway_status_list() -> list[dict]:
             "tun_device": gw.tun_device,
             "route_table": gw.route_table,
             "node_id": gw.openvpn_node_id,
+            "openvpn_running": gw.openvpn_process is not None and gw.openvpn_process.poll() is None,
             "is_connecting": gw.is_connecting,
             "connection_enabled": gw.connection_enabled,
             "health_ok": gw.health_ok,

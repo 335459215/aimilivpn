@@ -4897,13 +4897,16 @@ def check_proxy_health() -> dict[str, Any]:
             except Exception:
                 pass
 
-    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
-    tun_path = Path("/sys/class/net/tun0")
-    if sys.platform.startswith("linux") and not tun_path.exists():
-        return {
-            "ok": False,
-            "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
-        }
+    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下，多网关模式跳过——gateway_manager 自行管理健康)
+    if sys.platform.startswith("linux"):
+        _gm = sys.modules.get('gateway_manager')
+        if not (_gm and _gm.is_active()):
+            tun_path = Path("/sys/class/net/tun0")
+            if not tun_path.exists():
+                return {
+                    "ok": False,
+                    "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+                }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
     def _curl_check_ip(url: str) -> dict[str, Any] | None:
@@ -5792,6 +5795,7 @@ def main() -> None:
     )
 
     # ── Multi-gateway mode: start proxy servers for each configured gateway ──
+    gm = None
     try:
         import gateway_manager as gm
         gm.set_globals(DATA_DIR, API_URL, OPENVPN_TEST_TIMEOUT_SECONDS)
@@ -5800,6 +5804,11 @@ def main() -> None:
         print("[网关] 多网关模式已启动 (gateway_manager)", flush=True)
     except Exception as e:
         _use_multi_gateway = False
+        try:
+            if gm:
+                gm.stop_all()
+        except Exception:
+            pass
         print(f"[网关] 多网关模式初始化失败，回退到单网关模式: {e}", flush=True)
     
     # ── Single-gateway fallback (legacy) ──
