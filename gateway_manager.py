@@ -395,15 +395,15 @@ def check_gateway_health(gw: GatewayState) -> dict:
         import vpngate_manager as vm
         proxy_url = f"http://127.0.0.1:{gw.proxy_port}"
         r = subprocess.run(
-            ["curl", "-s", "--max-time", "10", "-x", proxy_url, "https://httpbin.org/ip"],
+            ["curl", "-s", "--max-time", "10", "-x", proxy_url, "https://checkip.amazonaws.com"],
             capture_output=True, text=True, timeout=15
         )
         if r.returncode == 0 and r.stdout:
             try:
-                ip = json.loads(r.stdout).get("origin", "")
+                ip = r.stdout.strip().strip('"').strip("'")
                 result["ok"] = bool(ip)
                 result["ip"] = ip
-            except json.JSONDecodeError:
+            except Exception:
                 pass
     except Exception as e:
         result["error"] = str(e)

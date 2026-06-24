@@ -1128,6 +1128,10 @@ def cleanup_policy_routing() -> None:
 
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
+    # Skip if multi-gateway is active; gateway_manager manages its own tunnels
+    _gm_check = sys.modules.get('gateway_manager')
+    if _gm_check and _gm_check.is_active():
+        return
     with lock:
         cleanup_policy_routing()
         config_to_delete = None
@@ -1286,7 +1290,10 @@ def enforce_active_node_allowed_by_routing(ui_cfg: dict[str, Any], reason: str =
         )
 
         if ui_cfg.get("connection_enabled", True) and ui_cfg.get("routing_mode") != "fixed_ip":
-            threading.Thread(target=auto_switch_node, daemon=True).start()
+                # Skip auto-switch if multi-gateway is active; gateway_manager handles it
+                _gm_check = sys.modules.get('gateway_manager')
+                if not (_gm_check and _gm_check.is_active()):
+                    threading.Thread(target=auto_switch_node, daemon=True).start()
         return msg
 
 def reconnect_fixed_node_if_needed(ui_cfg: dict[str, Any]) -> bool:
@@ -1518,6 +1525,10 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     return list(updated_nodes_map.values())
 
 def auto_switch_node(attempt: int = 0) -> None:
+    # Skip if multi-gateway is active; gateway_manager handles all connections
+    _gm_check = sys.modules.get('gateway_manager')
+    if _gm_check and _gm_check.is_active():
+        return
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
         return
@@ -1586,6 +1597,10 @@ def auto_switch_node(attempt: int = 0) -> None:
 
 def connect_node(node_id: str) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
+    # Skip if multi-gateway is active
+    _gm_check = sys.modules.get('gateway_manager')
+    if _gm_check and _gm_check.is_active():
+        return "[多网关模式] gateway_manager 已接管连接管理"
     node_id = str(node_id or "").strip()
     if not node_id:
         raise ValueError("Node id is required")
@@ -1822,7 +1837,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
             and ui_cfg.get("routing_mode", "auto") != "fixed_ip"
             and not active_openvpn_running()
         )
-        if should_fast_connect:
+        if should_fast_connect and not _multi:
             with lock:
                 current_nodes = read_nodes()
                 fast_candidates = [
@@ -1907,7 +1922,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 print(warn_msg, flush=True)
                 log_to_json("WARNING", "Main", warn_msg)
             
-            if not active_openvpn_running():
+            if not active_openvpn_running() and not _multi:
                 ui_cfg = load_ui_config()
                 connection_enabled = ui_cfg.get("connection_enabled", True)
                 if connection_enabled:
